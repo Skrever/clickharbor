@@ -38,7 +38,7 @@ The interface follows the system’s light or dark appearance and respects macOS
 
 ## Build from source
 
-Install the Xcode Command Line Tools with Swift 6 on macOS, then run the build.
+To build from source, use macOS 15 or later with the Xcode Command Line Tools and Swift 6.
 
 ```sh
 ./build.sh

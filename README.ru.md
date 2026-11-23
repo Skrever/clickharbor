@@ -38,7 +38,7 @@ ClickHarbor — нативное приложение для настройки 
 
 ## Сборка из исходников
 
-Установите Xcode Command Line Tools со Swift 6 на macOS и запустите сборку.
+Для сборки из исходников нужна macOS 15 или новее и Xcode Command Line Tools со Swift 6.
 
 ```sh
 ./build.sh
