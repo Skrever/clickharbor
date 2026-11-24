@@ -116,13 +116,22 @@ int32_t airox_hid_query(AiroxHID *hid, uint8_t code, uint8_t *response) {
     return kIOReturnSuccess;
 }
 
-int32_t airox_hid_write(AiroxHID *hid, const uint8_t *packet) {
+static int32_t write_report(AiroxHID *hid, const uint8_t *packet, bool require_confirmation) {
     hid->expected_code = packet[0];
     hid->received = false;
     IOReturn status = IOHIDDeviceSetReport(hid->device, kIOHIDReportTypeOutput, 0, packet, report_size);
     if (status != kIOReturnSuccess) return status;
-    pump(hid, 0.16);
+    pump(hid, require_confirmation ? 0.45 : 0.16);
+    if (require_confirmation && !hid->received) return AiroxHIDNoReply;
     return kIOReturnSuccess;
+}
+
+int32_t airox_hid_write(AiroxHID *hid, const uint8_t *packet) {
+    return write_report(hid, packet, false);
+}
+
+int32_t airox_hid_write_confirmed(AiroxHID *hid, const uint8_t *packet) {
+    return write_report(hid, packet, true);
 }
 
 void airox_hid_close(AiroxHID *hid) {

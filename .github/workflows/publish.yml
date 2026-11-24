@@ -1,6 +1,9 @@
 name: Publish macOS release
 
 on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
     inputs:
       tag:
@@ -12,7 +15,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: publish-${{ inputs.tag }}
+  group: publish-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -20,7 +23,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 20
     env:
-      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - name: Validate the release tag
         shell: bash
@@ -33,7 +36,7 @@ jobs:
       - name: Check out tagged source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
           persist-credentials: false
 
       - name: Test and package the universal app
@@ -44,12 +47,28 @@ jobs:
           xcrun swift test --disable-xctest
           ./release.sh
 
-      - name: Attach verified archive and checksum
+      - name: Publish verified macOS downloads
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           cd build
-          archive="ClickHarbor-${RELEASE_TAG#v}-macOS-universal.zip"
-          /usr/bin/shasum -a 256 -c "$archive.sha256"
-          gh release upload "$RELEASE_TAG" "$archive" "$archive.sha256" --repo "$GITHUB_REPOSITORY"
+          base="ClickHarbor-${RELEASE_TAG#v}-macOS-universal"
+          for extension in dmg zip; do
+            /usr/bin/shasum -a 256 -c "$base.$extension.sha256"
+          done
+          assets=("$base.dmg" "$base.dmg.sha256" "$base.zip" "$base.zip.sha256")
+          if existing=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'); then
+            missing=()
+            for asset in "${assets[@]}"; do
+              if ! grep -Fxq -- "$asset" <<< "$existing"; then
+                missing+=("$asset")
+              fi
+            done
+            if (( ${#missing[@]} )); then
+              gh release upload "$RELEASE_TAG" "${missing[@]}" --repo "$GITHUB_REPOSITORY"
+            fi
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --generate-notes --title "ClickHarbor ${RELEASE_TAG#v}"
+          fi

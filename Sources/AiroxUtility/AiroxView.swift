@@ -6,16 +6,28 @@ struct AiroxView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var page = Page.settings
+    @State private var showingPairing = false
+    @State private var confirmingReset = false
+    @State private var separateAxes = false
+    @State private var shortcutButton: Int?
     @Namespace private var sidebarSelection
 
     private enum Page: String, CaseIterable {
         case settings = "Настройки"
+        case lighting = "Подсветка"
         case buttons = "Кнопки"
+        case advanced = "Сенсор и питание"
+        case profiles = "Профили"
+        case macros = "Макросы"
 
         var symbol: String {
             switch self {
             case .settings: "slider.horizontal.3"
+            case .lighting: "lightbulb"
             case .buttons: "cursorarrow.click.2"
+            case .advanced: "scope"
+            case .profiles: "square.stack"
+            case .macros: "command"
             }
         }
     }
@@ -41,6 +53,20 @@ struct AiroxView: View {
         .frame(minWidth: 710, idealWidth: 900, minHeight: 540, idealHeight: 685)
         .background(palette.workspace)
         .tint(palette.accent)
+        .sheet(isPresented: $showingPairing) { pairingInstructions }
+        .sheet(isPresented: Binding(get: { shortcutButton != nil }, set: { if !$0 { shortcutButton = nil } })) {
+            if let index = shortcutButton, let action = model.draft?.buttons[index] {
+                MouseShortcutEditor(name: selectedModel.buttonName(at: index), action: action) {
+                    model.draft?.buttons[index] = $0
+                }
+            }
+        }
+        .alert("Сбросить настройки Aurora?", isPresented: $confirmingReset) {
+            Button("Сбросить", role: .destructive) { model.resetAurora() }
+            Button("Отмена", role: .cancel) {}
+        } message: {
+            Text("Настройки в памяти мыши и назначения кнопок будут заменены заводскими.")
+        }
     }
 
     private var palette: HarborPalette { HarborPalette(dark: colorScheme == .dark) }
@@ -120,6 +146,12 @@ struct AiroxView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if let battery = model.deviceDetails?.batteryPercent {
+                Label("\(battery)%", systemImage: model.deviceDetails?.charging == true ? "battery.100percent.bolt" : "battery.75percent")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel(model.deviceDetails?.charging == true ? "Зарядка, \(battery)%" : "Заряд, \(battery)%")
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(11)
@@ -180,8 +212,16 @@ struct AiroxView: View {
                                 stages(draft)
                                 performance(draft)
                             }
+                        case .lighting:
+                            lighting(draft)
                         case .buttons:
                             buttons(draft)
+                        case .advanced:
+                            advanced(draft.advanced)
+                        case .profiles:
+                            profiles(draft)
+                        case .macros:
+                            panel { MouseMacrosView(model: model, mouse: selectedModel).id(model.selected) }
                         }
                     }
                     .id(page)
@@ -222,7 +262,7 @@ struct AiroxView: View {
                             .foregroundStyle(palette.accent)
                     }
                     .accessibilityElement(children: .combine)
-                    Text("Ступень \(draft.activeStage + 1) из \(draft.stages.count)")
+                    Text("Ступень \(draft.activeStage + 1) из \(draft.enabledStageCount ?? draft.stages.count)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
@@ -260,8 +300,30 @@ struct AiroxView: View {
                     .foregroundStyle(.secondary)
             }
 
+            if let count = draft.enabledStageCount {
+                HStack {
+                    Text("Число ступеней")
+                    Spacer()
+                    Picker("Число ступеней", selection: Binding(get: { model.draft?.enabledStageCount ?? count }, set: { value in
+                        model.draft?.enabledStageCount = value
+                        if let active = model.draft?.activeStage, active >= value {
+                            model.draft?.activeStage = value - 1
+                        }
+                    })) {
+                        ForEach(1...draft.stages.count, id: \.self) { value in
+                            Text(String(value)).tag(value)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+            }
+
+            Toggle("Редактировать DPI по осям", isOn: $separateAxes)
+                .toggleStyle(.checkbox)
+
             VStack(spacing: 3) {
-                ForEach(draft.stages.indices, id: \.self) { index in
+                ForEach(draft.stages.indices.prefix(draft.enabledStageCount ?? draft.stages.count), id: \.self) { index in
                     stageRow(index, draft)
                 }
             }
@@ -288,15 +350,34 @@ struct AiroxView: View {
             .buttonStyle(.plain)
             .accessibilityAddTraits(selected ? .isSelected : [])
 
-            DPIField(value: stageValue(index), secondaryValue: draft.stages[index].y,
-                     label: "Ступень \(index + 1), DPI")
-                .frame(width: 102)
+            if separateAxes {
+                axisField("X", index: index, coordinate: \.x, value: draft.stages[index].x)
+                axisField("Y", index: index, coordinate: \.y, value: draft.stages[index].y)
+            } else {
+                DPIField(value: stageValue(index), secondaryValue: draft.stages[index].y,
+                         label: "Ступень \(index + 1), DPI")
+                    .frame(width: 102)
+            }
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 3)
         .background {
             RoundedRectangle(cornerRadius: 7)
                 .fill(selected ? palette.accent.opacity(0.10) : Color.clear)
+        }
+    }
+
+    private func axisField(_ axis: String, index: Int, coordinate: WritableKeyPath<DPIStage, Int>, value: Int) -> some View {
+        HStack(spacing: 4) {
+            Text(axis).font(.caption).foregroundStyle(.secondary).accessibilityHidden(true)
+            DPIField(value: Binding(get: {
+                guard let stages = model.draft?.stages, stages.indices.contains(index) else { return value }
+                return stages[index][keyPath: coordinate]
+            }, set: { newValue in
+                guard model.draft?.stages.indices.contains(index) == true else { return }
+                model.draft?.stages[index][keyPath: coordinate] = newValue
+            }), secondaryValue: value, label: "Ступень \(index + 1), ось \(axis), DPI")
+            .frame(width: 65)
         }
     }
 
@@ -334,6 +415,247 @@ struct AiroxView: View {
         }
     }
 
+    private func lighting(_ draft: AiroxSettings) -> some View {
+        VStack(spacing: 13) {
+            if draft.advanced.stageColors.isEmpty && draft.advanced.dpiIndicator == nil {
+                panel {
+                    Text("Мышь не предоставила настройки подсветки")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if !draft.advanced.stageColors.isEmpty {
+                panel {
+                    Label("Цвета ступеней DPI", systemImage: "paintpalette")
+                        .font(.headline)
+                        .accessibilityAddTraits(.isHeader)
+
+                    ForEach(draft.advanced.stageColors.indices.prefix(draft.enabledStageCount ?? draft.stages.count), id: \.self) { index in
+                        HStack(spacing: 9) {
+                            Circle()
+                                .fill(Color(mouseRGB: draft.advanced.stageColors[index]))
+                                .overlay { Circle().strokeBorder(Color.primary.opacity(0.17)) }
+                                .frame(width: 12, height: 12)
+                                .accessibilityHidden(true)
+                            Text("Ступень \(index + 1)")
+                            if draft.stages.indices.contains(index) {
+                                Text("\(String(draft.stages[index].x)) DPI")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            ColorPicker("Цвет ступени \(index + 1)", selection: stageColor(index, draft.advanced.stageColors[index]), supportsOpacity: false)
+                                .labelsHidden()
+                        }
+                        .padding(.vertical, 3)
+                    }
+                }
+            }
+
+            if let indicator = draft.advanced.dpiIndicator {
+                panel {
+                    Label("Индикатор DPI", systemImage: "lightbulb")
+                        .font(.headline)
+                        .accessibilityAddTraits(.isHeader)
+
+                    Picker("Режим", selection: indicatorMode(indicator)) {
+                        Text("Выключен").tag(0)
+                        Text("Постоянный свет").tag(1)
+                        Text("Пульсация").tag(2)
+                        if indicator.enabled && !(1...2).contains(indicator.mode) {
+                            Text("Текущий режим").tag(indicator.mode)
+                        }
+                    }
+
+                    if indicator.enabled {
+                        Picker("Яркость", selection: indicatorValue(\.brightness, fallback: indicator.brightness)) {
+                            if !Self.indicatorBrightness.contains(indicator.brightness) {
+                                Text("Текущая яркость").tag(indicator.brightness)
+                            }
+                            ForEach(Self.indicatorBrightness.indices, id: \.self) { index in
+                                Text("\(index + 1) из 10").tag(Self.indicatorBrightness[index])
+                            }
+                        }
+                        if indicator.mode == 2 {
+                            Picker("Скорость пульсации", selection: indicatorValue(\.speed, fallback: indicator.speed)) {
+                                ForEach(options(Array(1...5), current: indicator.speed), id: \.self) { speed in
+                                    Text("\(speed) из 5").tag(speed)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func advanced(_ settings: MouseAdvancedSettings) -> some View {
+        VStack(spacing: 13) {
+            panel {
+                Label("Сенсор", systemImage: "scope")
+                    .font(.headline)
+                    .accessibilityAddTraits(.isHeader)
+
+                if let liftOff = settings.liftOff {
+                    Picker("Высота отрыва", selection: advancedValue(\.liftOff, fallback: liftOff)) {
+                        ForEach(options([1, 2], current: liftOff), id: \.self) { height in
+                            Text("\(height) мм").tag(height)
+                        }
+                    }
+                }
+                if let mode = settings.sensorMode {
+                    Picker("Режим сенсора", selection: advancedValue(\.sensorMode, fallback: mode)) {
+                        Text("Обычный").tag(0)
+                        Text("Высокая производительность").tag(1)
+                        if !(0...1).contains(mode) { Text("Текущий режим").tag(mode) }
+                    }
+                }
+                if let motionSync = settings.motionSync {
+                    Toggle("Синхронизация движения", isOn: advancedValue(\.motionSync, fallback: motionSync))
+                }
+                if let snapping = settings.angleSnapping {
+                    Toggle("Выпрямление траектории", isOn: advancedValue(\.angleSnapping, fallback: snapping))
+                }
+                if let rippleControl = settings.rippleControl {
+                    Toggle("Подавление дрожания курсора", isOn: advancedValue(\.rippleControl, fallback: rippleControl))
+                }
+            }
+
+            panel {
+                Label("Питание", systemImage: "battery.75percent")
+                    .font(.headline)
+                    .accessibilityAddTraits(.isHeader)
+
+                if let sleepSeconds = settings.sleepSeconds {
+                    durationPicker("Сон после простоя", \.sleepSeconds, current: sleepSeconds, values: selectedModel.sleepValues)
+                }
+                if let performance = settings.highPerformance {
+                    Toggle("Режим полной производительности", isOn: advancedValue(\.highPerformance, fallback: performance))
+                    if performance, let seconds = settings.highPerformanceSeconds {
+                        durationPicker("Выход из режима после простоя", \.highPerformanceSeconds, current: seconds,
+                                       values: AuroraAdvancedSnapshot.highPerformanceSeconds)
+                    }
+                }
+                if let wake = settings.wakeOnMovement {
+                    Toggle("Пробуждение движением", isOn: advancedValue(\.wakeOnMovement, fallback: wake))
+                }
+                if let lightsOff = settings.lightsOffOnMovement {
+                    Toggle("Гасить подсветку при движении", isOn: advancedValue(\.lightsOffOnMovement, fallback: lightsOff))
+                }
+            }
+
+            panel {
+                HStack {
+                    Label("Сведения об устройстве", systemImage: "info.circle")
+                        .font(.headline)
+                        .accessibilityAddTraits(.isHeader)
+                    Spacer()
+                    Button("Считать") { model.readDeviceDetails() }
+                }
+                if let info = model.deviceDetails {
+                    if let battery = info.batteryPercent {
+                        LabeledContent("Заряд", value: info.charging == true ? "\(battery)% · заряжается" : "\(battery)%")
+                    }
+                    if let version = info.firmwareVersion { LabeledContent("Прошивка мыши", value: version) }
+                    if let version = info.receiverFirmwareVersion { LabeledContent("Прошивка приёмника", value: version) }
+                    if info.batteryPercent == nil && info.firmwareVersion == nil && info.receiverFirmwareVersion == nil {
+                        Text("Устройство не предоставило сведения").font(.callout).foregroundStyle(.secondary)
+                    }
+                }
+                if selectedModel == .aurora {
+                    HStack {
+                        if model.canPairReceiver {
+                            Button("Сопряжение с приёмником…") { showingPairing = true }.disabled(model.hasChanges)
+                        }
+                        if model.deviceDetails?.canFactoryReset == true {
+                            Button("Сбросить настройки…", role: .destructive) { confirmingReset = true }
+                        }
+                    }
+                }
+            }
+        }
+        .pickerStyle(.menu)
+        .toggleStyle(.switch)
+    }
+
+    private func durationPicker(_ title: String, _ field: WritableKeyPath<MouseAdvancedSettings, Int?>,
+                                current: Int, values: [Int]) -> some View {
+        Picker(title, selection: advancedValue(field, fallback: current)) {
+            ForEach(options(values, current: current), id: \.self) { duration in
+                Text(duration % 60 == 0 && duration > 0 ? "\(duration / 60) мин" : "\(duration) с").tag(duration)
+            }
+        }
+    }
+
+    private func profiles(_ draft: AiroxSettings) -> some View {
+        VStack(spacing: 13) {
+            panel {
+                MouseProfilesView(model: selectedModel,
+                                  settings: Binding(get: { model.draft ?? draft }, set: { model.draft = $0 }))
+                    .id(selectedModel)
+            }
+            if selectedModel == .aurora {
+                panel {
+                    HStack {
+                        Label("Профили в мыши", systemImage: "externaldrive")
+                            .font(.headline)
+                            .accessibilityAddTraits(.isHeader)
+                        Spacer()
+                        Button("Проверить поддержку") { model.readDeviceDetails() }
+                    }
+                    if let current = model.onboardProfile {
+                        Picker("Активный профиль", selection: Binding(get: { model.onboardProfile ?? current }, set: { model.switchOnboardProfile($0) })) {
+                            ForEach(0..<AuroraController.onboardProfileCount, id: \.self) { index in
+                                Text("Профиль \(index + 1)").tag(index)
+                            }
+                        }
+                        .disabled(model.hasChanges)
+                    } else if model.deviceDetails != nil {
+                        Text("Прошивка не предоставила встроенные профили").font(.callout).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    private func advancedValue<Value>(_ field: WritableKeyPath<MouseAdvancedSettings, Value?>, fallback: Value) -> Binding<Value> {
+        Binding(get: { model.draft?.advanced[keyPath: field] ?? fallback },
+                set: { model.draft?.advanced[keyPath: field] = $0 })
+    }
+
+    private func indicatorMode(_ indicator: MouseDPIIndicator) -> Binding<Int> {
+        Binding {
+            let value = model.draft?.advanced.dpiIndicator ?? indicator
+            return value.enabled ? value.mode : 0
+        } set: { value in
+            model.draft?.advanced.dpiIndicator?.enabled = value != 0
+            if value != 0 { model.draft?.advanced.dpiIndicator?.mode = value }
+        }
+    }
+
+    private func indicatorValue(_ field: WritableKeyPath<MouseDPIIndicator, Int>, fallback: Int) -> Binding<Int> {
+        Binding(get: { model.draft?.advanced.dpiIndicator?[keyPath: field] ?? fallback },
+                set: { model.draft?.advanced.dpiIndicator?[keyPath: field] = $0 })
+    }
+
+    private static let indicatorBrightness = AuroraAdvancedSnapshot.indicatorBrightness
+
+    private func stageColor(_ index: Int, _ fallback: MouseRGB) -> Binding<Color> {
+        Binding {
+            guard let colors = model.draft?.advanced.stageColors, colors.indices.contains(index) else {
+                return Color(mouseRGB: fallback)
+            }
+            return Color(mouseRGB: colors[index])
+        } set: { color in
+            guard model.draft?.advanced.stageColors.indices.contains(index) == true,
+                  let value = NSColor(color).usingColorSpace(.sRGB) else { return }
+            model.draft?.advanced.stageColors[index] = MouseRGB(
+                UInt8(clamping: Int((value.redComponent * 255).rounded())),
+                UInt8(clamping: Int((value.greenComponent * 255).rounded())),
+                UInt8(clamping: Int((value.blueComponent * 255).rounded()))
+            )
+        }
+    }
+
     private func buttons(_ draft: AiroxSettings) -> some View {
         panel {
             VStack(spacing: 0) {
@@ -356,12 +678,20 @@ struct AiroxView: View {
 
                         Picker(name, selection: buttonValue(index, fallback: current)) {
                             ForEach(options(selectedModel.buttonChoices, current: current), id: \.self) { action in
-                                Text(action.label).tag(action)
+                                Text(buttonActionName(action)).tag(action)
                             }
                         }
                         .labelsHidden()
                         .pickerStyle(.menu)
-                        .frame(width: 220)
+                        .frame(maxWidth: 220)
+
+                        Button {
+                            shortcutButton = index
+                        } label: {
+                            Image(systemName: "keyboard")
+                        }
+                        .help("Назначить клавишу или сочетание")
+                        .accessibilityLabel("Назначить сочетание для кнопки \(name)")
                     }
                     .padding(.vertical, 7)
 
@@ -385,6 +715,14 @@ struct AiroxView: View {
         }
     }
 
+    private func buttonActionName(_ action: ButtonAction) -> String {
+        if let assignment = action.auroraMacroAssignment {
+            return model.deviceMacros?[assignment.slot]?.name ?? "Макрос \(assignment.slot + 1)"
+        }
+        if action.airoxMacroAssignment != nil { return "Макрос Airox" }
+        return action.label
+    }
+
     private var connectionView: some View {
         VStack(spacing: 13) {
             HarborSignal(color: model.unsupportedMousePresent && model.selected == nil ? palette.warning : palette.accent,
@@ -406,9 +744,37 @@ struct AiroxView: View {
             if model.unsupportedMousePresent && model.selected != nil {
                 unsupportedNotice
             }
+            if model.canPairReceiver {
+                Button("Сопряжение с приёмником…") { showingPairing = true }
+                    .disabled(model.busy)
+            }
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var pairingInstructions: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("Сопряжение Aurora", systemImage: "antenna.radiowaves.left.and.right")
+                .font(.title2.weight(.semibold))
+            Text("Подключите приёмник к Mac, отсоедините кабель от мыши и переведите её в режим 2,4 ГГц.")
+            Text("Удерживайте левую и правую кнопки вместе с колесом до мигания жёлтого индикатора.")
+            Text("Держите мышь рядом с приёмником до завершения поиска.")
+            HStack {
+                Spacer()
+                Button("Отмена") { showingPairing = false }.keyboardShortcut(.cancelAction)
+                Button("Начать сопряжение") {
+                    showingPairing = false
+                    model.pairAurora()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(!model.canPairReceiver || model.busy)
+            }
+            .padding(.top, 8)
+        }
+        .padding(24)
+        .frame(width: 420)
     }
 
     private var unsupportedNotice: some View {
@@ -521,6 +887,67 @@ struct AiroxView: View {
 
     private func options<Value: Equatable>(_ values: [Value], current: Value) -> [Value] {
         values.contains(current) ? values : [current] + values
+    }
+}
+
+private struct MouseShortcutEditor: View {
+    let name: String
+    let apply: (ButtonAction) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var modifiers: UInt8
+    @State private var key: UInt8
+
+    init(name: String, action: ButtonAction, apply: @escaping (ButtonAction) -> Void) {
+        self.name = name
+        self.apply = apply
+        _modifiers = State(initialValue: action.keyboardShortcut ? action.first : 0)
+        _key = State(initialValue: action.keyboardShortcut ? action.second : 4)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Клавиша или сочетание").font(.title2.weight(.semibold))
+            Text(name).foregroundStyle(.secondary)
+            HStack(spacing: 12) {
+                modifier("⌃ Control", bit: 1)
+                modifier("⇧ Shift", bit: 2)
+                modifier("⌥ Option", bit: 4)
+                modifier("⌘ Command", bit: 8)
+            }
+            .toggleStyle(.checkbox)
+            Picker("Клавиша", selection: $key) {
+                ForEach(MouseMacroInput.keys, id: \.0) { usage, label in Text(label).tag(UInt8(usage)) }
+                if !MouseMacroInput.keys.contains(where: { $0.0 == UInt16(key) }) {
+                    Text("HID \(String(key, radix: 16))").tag(key)
+                }
+            }
+            HStack {
+                Spacer()
+                Button("Отмена") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Назначить") {
+                    apply(ButtonAction(0x70, modifiers, key))
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(minWidth: 390)
+    }
+
+    private func modifier(_ name: String, bit: UInt8) -> some View {
+        let bothSides = bit | bit << 4
+        return Toggle(name, isOn: Binding(get: { modifiers & bothSides != 0 }, set: { enabled in
+            if enabled { modifiers |= bit } else { modifiers &= ~bothSides }
+        }))
+    }
+}
+
+private extension Color {
+    init(mouseRGB: MouseRGB) {
+        self.init(.sRGB, red: Double(mouseRGB.red) / 255, green: Double(mouseRGB.green) / 255,
+                  blue: Double(mouseRGB.blue) / 255, opacity: 1)
     }
 }
 

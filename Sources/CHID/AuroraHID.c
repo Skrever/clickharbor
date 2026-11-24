@@ -23,6 +23,7 @@ struct AuroraHID {
     uint8_t input[report_size];
     uint8_t request[report_size];
     uint8_t reply[report_size];
+    size_t reply_prefix_length;
     bool received;
 };
 
@@ -84,7 +85,7 @@ static void on_input(void *context, IOReturn status, void *sender, IOHIDReportTy
 
     uint8_t packet[report_size] = {report_id};
     memcpy(packet + (length == report_size ? 0 : 1), data, (size_t)length);
-    if (memcmp(packet, hid->request, payload_offset) != 0 ||
+    if (hid->reply_prefix_length == 0 || memcmp(packet, hid->request, hid->reply_prefix_length) != 0 ||
         packet[report_size - 1] != checksum(packet)) return;
     memcpy(hid->reply, packet, sizeof(packet));
     hid->received = true;
@@ -130,6 +131,18 @@ AuroraHID *aurora_hid_open(AuroraHIDRoute route, int32_t *status) {
     return hid;
 }
 
+bool aurora_hid_is_aurora_product(AuroraHID *hid) {
+    if (!hid) return false;
+    CFTypeRef product = IOHIDDeviceGetProperty(hid->device, CFSTR(kIOHIDProductKey));
+    CFStringRef expected = hid->route == AuroraHIDReceiver ? CFSTR("IO Aurora Receiver") : CFSTR("IO Aurora");
+    return product && CFGetTypeID(product) == CFStringGetTypeID() &&
+           CFStringCompare(product, expected, kCFCompareCaseInsensitive) == kCFCompareEqualTo;
+}
+
+bool aurora_hid_is_pairable_receiver(AuroraHID *hid) {
+    return hid && hid->route == AuroraHIDReceiver && aurora_hid_is_aurora_product(hid);
+}
+
 static void prepare(AuroraHID *hid, uint8_t command, uint16_t address, uint8_t count) {
     memset(hid->request, 0, sizeof(hid->request));
     hid->request[0] = report_id;
@@ -137,6 +150,7 @@ static void prepare(AuroraHID *hid, uint8_t command, uint16_t address, uint8_t c
     hid->request[3] = (uint8_t)(address >> 8);
     hid->request[4] = (uint8_t)address;
     hid->request[5] = count;
+    hid->reply_prefix_length = payload_offset;
 }
 
 static IOReturn exchange(AuroraHID *hid, double timeout) {
@@ -179,6 +193,23 @@ int32_t aurora_hid_write(AuroraHID *hid, uint16_t address, uint8_t count, const 
     memcpy(hid->request + payload_offset, data, count);
     // Read-back is authoritative even when the device does not echo the write.
     return exchange(hid, 0.16);
+}
+
+int32_t aurora_hid_command(AuroraHID *hid, uint8_t command, uint8_t argument_count,
+                           const uint8_t *arguments, uint32_t timeout_ms, uint8_t *reply) {
+    const size_t argument_offset = 3;
+    if (!hid || !reply || timeout_ms == 0 || (argument_count && !arguments) ||
+        argument_count > report_size - 1 - argument_offset) return kIOReturnBadArgument;
+
+    prepare(hid, command, 0, 0);
+    if (argument_count) memcpy(hid->request + argument_offset, arguments, argument_count);
+    hid->reply_prefix_length = 2;
+    IOReturn status = exchange(hid, timeout_ms / 1000.0);
+    if (status != kIOReturnSuccess) return status;
+    if (!hid->received) return AiroxHIDNoReply;
+
+    memcpy(reply, hid->reply, sizeof(hid->reply));
+    return kIOReturnSuccess;
 }
 
 void aurora_hid_close(AuroraHID *hid) {

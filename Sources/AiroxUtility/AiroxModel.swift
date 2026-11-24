@@ -18,6 +18,14 @@ enum MouseConnection: CaseIterable, Sendable {
     }
 }
 
+struct MouseDeviceDetails {
+    let batteryPercent: Int?
+    let charging: Bool?
+    let firmwareVersion: String?
+    let receiverFirmwareVersion: String?
+    var canFactoryReset = false
+}
+
 @MainActor
 final class AiroxModel: ObservableObject {
     @Published var draft: AiroxSettings?
@@ -27,6 +35,9 @@ final class AiroxModel: ObservableObject {
     @Published private(set) var selected: MouseConnection?
     @Published private(set) var available: [MouseConnection] = []
     @Published private(set) var unsupportedMousePresent = false
+    @Published private(set) var deviceMacros: [MouseMacro?]?
+    @Published private(set) var deviceDetails: MouseDeviceDetails?
+    @Published private(set) var onboardProfile: Int?
 
     private let airox = AiroxController()
     private let aurora = AuroraController()
@@ -35,6 +46,14 @@ final class AiroxModel: ObservableObject {
     var deviceName: String { selected?.model.rawValue ?? "ClickHarbor" }
     var connected: Bool { baseline != nil }
     var hasChanges: Bool { connected && draft != baseline }
+    var canPairReceiver: Bool { selected == .auroraReceiver }
+    private var auroraRoute: AuroraHIDRoute? {
+        switch selected {
+        case .auroraCable: AuroraHIDCable
+        case .auroraReceiver: AuroraHIDReceiver
+        default: nil
+        }
+    }
     var connectionStatus: String {
         if selected == .auroraReceiver {
             return connected ? "Подключена по 2,4 ГГц" : "Приёмник 2,4 ГГц подключён"
@@ -133,6 +152,145 @@ final class AiroxModel: ObservableObject {
         }
     }
 
+    func readDeviceMacros() {
+        guard let route = auroraRoute else { return }
+        operate("Чтение макросов…", done: "Макросы считаны с мыши") {
+            self.deviceMacros = try await self.aurora.readMacros(on: route)
+        }
+    }
+
+    func saveDeviceMacro(_ macro: MouseMacro, slot: Int) {
+        guard let route = auroraRoute else { return }
+        operate("Запись макроса…", done: "Макрос сохранён в мыши") {
+            try await self.aurora.writeMacro(macro, to: slot, on: route)
+            self.deviceMacros?[slot] = macro
+        }
+    }
+
+    func eraseDeviceMacro(slot: Int) {
+        guard let route = auroraRoute else { return }
+        operate("Удаление макроса…", done: "Макрос удалён из мыши") {
+            guard self.draft?.buttons.contains(where: { $0.auroraMacroAssignment?.slot == slot }) != true else {
+                throw AiroxError.invalidSetting("Сначала измените назначение кнопки, которая запускает этот макрос.")
+            }
+            try await self.aurora.eraseMacro(in: slot, on: route)
+            self.deviceMacros?[slot] = nil
+        }
+    }
+
+    func assignAuroraMacro(slot: Int, button: Int, rule: MouseMacroRepeat) {
+        guard let macros = deviceMacros, macros.indices.contains(slot), macros[slot] != nil,
+              draft?.buttons.indices.contains(button) == true,
+              let action = ButtonAction.auroraMacro(slot: slot, repeat: rule) else { return }
+        draft?.buttons[button] = action
+    }
+
+    func installAiroxMacro(_ macro: MouseMacro, button: Int, rule: MouseMacroRepeat) {
+        guard selected == .airoxCable, !hasChanges else { return }
+        operate("Запись макроса и назначения…", done: "Макрос назначен на кнопку") {
+            let actual = try await self.airox.writeMacro(macro, to: button, repeat: rule)
+            self.baseline = actual
+            self.draft = actual
+        }
+    }
+
+    func readDeviceDetails() {
+        guard let selected else { return }
+        operate("Чтение сведений об устройстве…", done: "Сведения об устройстве обновлены") {
+            if let route = self.auroraRoute {
+                let info = try await self.aurora.deviceInfo(on: route)
+                self.deviceDetails = MouseDeviceDetails(batteryPercent: info.batteryPercent, charging: info.charging,
+                                                        firmwareVersion: info.firmwareVersion,
+                                                        receiverFirmwareVersion: info.receiverFirmwareVersion,
+                                                        canFactoryReset: info.canFactoryReset)
+                self.onboardProfile = try? await self.aurora.onboardProfile(on: route)
+            } else if selected == .airoxCable {
+                let info = try await self.airox.deviceInfo()
+                self.deviceDetails = MouseDeviceDetails(batteryPercent: info.batteryPercent, charging: info.charging,
+                                                        firmwareVersion: info.firmwareVersion, receiverFirmwareVersion: nil)
+            }
+        }
+    }
+
+    func switchOnboardProfile(_ profile: Int) {
+        guard let route = auroraRoute, onboardProfile != nil, !hasChanges else { return }
+        operate("Переключение профиля…", done: "Профиль мыши переключён") {
+            do {
+                self.onboardProfile = try await self.aurora.selectOnboardProfile(profile, on: route)
+                let actual = try await self.aurora.read(on: route)
+                self.baseline = actual
+                self.draft = actual
+                self.deviceMacros = nil
+            } catch {
+                self.clearSettings()
+                if let actual = try? await self.aurora.read(on: route) {
+                    self.baseline = actual
+                    self.draft = actual
+                }
+                throw error
+            }
+        }
+    }
+
+    func resetAurora() {
+        guard let route = auroraRoute, deviceDetails?.canFactoryReset == true else { return }
+        operate("Восстановление заводских настроек…", done: "Заводские настройки считаны с Aurora") {
+            self.clearSettings()
+            do {
+                let actual = try await self.aurora.factoryReset(on: route)
+                self.baseline = actual
+                self.draft = actual
+            } catch {
+                if let actual = try? await self.aurora.read(on: route) {
+                    self.baseline = actual
+                    self.draft = actual
+                }
+                throw error
+            }
+        }
+    }
+
+    func pairAurora() {
+        guard canPairReceiver else { return }
+        operate("Поиск мыши для сопряжения…", done: "Aurora сопряжена с приёмником", requiresSettings: false) {
+            self.clearSettings()
+            let result = try await self.aurora.pairReceiver(on: AuroraHIDReceiver) { [weak self] remaining in
+                Task { @MainActor in
+                    guard let self, self.busy, self.canPairReceiver, let remaining else { return }
+                    self.status = "Поиск мыши · ещё \(remaining) с"
+                }
+            }
+            switch result {
+            case .paired:
+                let actual = try await self.aurora.read(on: AuroraHIDReceiver)
+                self.baseline = actual
+                self.draft = actual
+            case .notFound, .timedOut:
+                throw AiroxError.invalidSetting("Приёмник не нашёл Aurora в режиме сопряжения.")
+            case .unconfirmed:
+                throw AiroxError.unconfirmed("сопряжение Aurora")
+            }
+        }
+    }
+
+    private func operate(_ message: String, done: String, requiresSettings: Bool = true,
+                         task: @escaping () async throws -> Void) {
+        guard !busy, !requiresSettings || connected else { return }
+        busy = true
+        error = nil
+        status = message
+        Task {
+            defer { busy = false }
+            do {
+                try await task()
+                status = done
+            } catch {
+                self.error = error.localizedDescription
+                status = "Операция не выполнена"
+            }
+        }
+    }
+
     private func scan() async -> [MouseConnection] {
         var connections: [MouseConnection] = []
         if await airox.isPresent() { connections.append(.airoxCable) }
@@ -154,5 +312,8 @@ final class AiroxModel: ObservableObject {
     private func clearSettings() {
         baseline = nil
         draft = nil
+        deviceMacros = nil
+        deviceDetails = nil
+        onboardProfile = nil
     }
 }

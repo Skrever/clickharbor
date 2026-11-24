@@ -40,7 +40,7 @@ enum AiroxError: LocalizedError {
 }
 
 enum AiroxPage: CaseIterable {
-    case identity, dpi, reportRate, debounce, buttons
+    case identity, dpi, reportRate, debounce, buttons, dpiColors, sensor, firmwareVersion
 
     var query: UInt8 {
         switch self {
@@ -48,7 +48,10 @@ enum AiroxPage: CaseIterable {
         case .buttons: 0x11
         case .reportRate: 0x12
         case .dpi: 0x13
+        case .dpiColors: 0x14
+        case .sensor: 0x16
         case .debounce: 0x17
+        case .firmwareVersion: 0x20
         }
     }
 
@@ -57,8 +60,11 @@ enum AiroxPage: CaseIterable {
         case .identity: "модель"
         case .dpi: "DPI"
         case .reportRate: "частота опроса"
-        case .debounce: "дебаунс"
+        case .debounce: "питание и дебаунс"
         case .buttons: "назначения кнопок"
+        case .dpiColors: "цвета ступеней DPI"
+        case .sensor: "параметры сенсора"
+        case .firmwareVersion: "версия прошивки"
         }
     }
 
@@ -71,30 +77,61 @@ enum AiroxPage: CaseIterable {
     }
 }
 
+struct AiroxDeviceInfo: Sendable {
+    let batteryPercent: Int?
+    let charging: Bool?
+    let firmwareVersion: String?
+
+    init(identity: [UInt8], version: [UInt8]?) {
+        if identity.count >= 10, identity[9] <= 100 {
+            batteryPercent = Int(identity[9])
+            charging = identity[8] == 1
+        } else {
+            batteryPercent = nil
+            charging = nil
+        }
+        if let version, version.count >= 2 {
+            firmwareVersion = String(format: "v%X.%02X", Int(version[0]), Int(version[1]))
+        } else {
+            firmwareVersion = nil
+        }
+    }
+}
+
 struct AiroxWrite {
     let page: AiroxPage
     let packet: [UInt8]
     let expectedPayload: [UInt8]
+    private let checkedPrefix: Int?
 
     static func checksum(_ report: [UInt8]) -> UInt8 {
         report[4..<31].reduce(0, &+)
     }
 
-    init(page: AiroxPage, code: UInt8, opcode: UInt8, payload: [UInt8], expected: [UInt8]? = nil) {
+    init(page: AiroxPage, code: UInt8, opcode: UInt8, payload: [UInt8],
+         expected: [UInt8]? = nil, checkedPrefix: Int? = nil) {
         self.page = page
         var bytes: [UInt8] = [code, 0, 1, opcode] + payload
         bytes += Array(repeating: 0, count: 32 - bytes.count)
         bytes[31] = Self.checksum(bytes)
         packet = bytes
         expectedPayload = expected ?? payload
+        self.checkedPrefix = checkedPrefix
+    }
+
+    func matches(_ readback: [UInt8]) -> Bool {
+        guard let checkedPrefix else { return readback == expectedPayload }
+        return readback.count == expectedPayload.count
+            && readback.prefix(checkedPrefix) == expectedPayload.prefix(checkedPrefix)
     }
 }
 
 struct AiroxSnapshot {
     let settings: AiroxSettings
-    let power: [UInt8]
+    private let advanced: AiroxAdvancedSnapshot
 
-    init(dpi: [UInt8], rate: [UInt8], power: [UInt8], buttons: [UInt8]) throws {
+    init(dpi: [UInt8], rate: [UInt8], power: [UInt8], buttons: [UInt8],
+         colors: [UInt8]? = nil, sensor: [UInt8]? = nil) throws {
         guard dpi.count == 25 else { throw AiroxError.invalidReply(AiroxPage.dpi.name) }
         let count = Int(dpi[0] & 15)
         let active = Int(dpi[0] >> 4)
@@ -102,8 +139,8 @@ struct AiroxSnapshot {
         guard rate.count == 1, [1, 2, 4, 8].contains(rate[0]) else {
             throw AiroxError.invalidReply(AiroxPage.reportRate.name)
         }
-        guard (4...5).contains(power.count) else { throw AiroxError.invalidReply(AiroxPage.debounce.name) }
         guard buttons.count == 18 else { throw AiroxError.invalidReply(AiroxPage.buttons.name) }
+        let advanced = try AiroxAdvancedSnapshot(colors: colors, sensor: sensor, power: power)
 
         settings = AiroxSettings(
             activeStage: active,
@@ -114,13 +151,12 @@ struct AiroxSnapshot {
             debounce: Int(power[3]),
             buttons: stride(from: 0, to: 18, by: 3).map {
                 ButtonAction(buttons[$0], buttons[$0 + 1], buttons[$0 + 2])
-            }
+            },
+            enabledStageCount: count,
+            advanced: advanced.settings
         )
-        self.power = power
-        dpiCount = count
+        self.advanced = advanced
     }
-
-    private let dpiCount: Int
 
     func writes(for proposed: AiroxSettings) throws -> [AiroxWrite] {
         var result: [AiroxWrite] = []
@@ -131,33 +167,29 @@ struct AiroxSnapshot {
             result.append(AiroxWrite(page: .reportRate, code: 0x02, opcode: 0x01,
                                      payload: [UInt8(1000 / proposed.reportRate)]))
         }
-        if proposed.debounce != settings.debounce {
-            guard AiroxSettings.debounceValues.contains(proposed.debounce) else {
-                throw AiroxError.invalidSetting("Выберите дебаунс от 4 до 20 мс.")
-            }
-            var readback = power
-            readback[3] = UInt8(proposed.debounce)
-            result.append(AiroxWrite(page: .debounce, code: 0x07, opcode: 0x04,
-                                     payload: Array(readback.prefix(4)), expected: readback))
-        }
+        result += try advanced.writes(for: proposed)
         if proposed.buttons != settings.buttons {
             guard proposed.buttons.count == settings.buttons.count else {
                 throw AiroxError.invalidSetting("Нужно указать назначения для шести кнопок.")
             }
+            if settings.buttons.contains(.leftClick), !proposed.buttons.contains(.leftClick) {
+                throw AiroxError.invalidSetting("Оставьте левый щелчок хотя бы на одной кнопке.")
+            }
             result.append(AiroxWrite(page: .buttons, code: 0x09, opcode: 0x0f,
                                      payload: proposed.buttons.flatMap(\.bytes)))
         }
-        if proposed.activeStage != settings.activeStage || proposed.stages != settings.stages {
-            guard (0..<dpiCount).contains(proposed.activeStage), proposed.stages.count == settings.stages.count else {
+        if proposed.activeStage != settings.activeStage || proposed.stages != settings.stages
+            || proposed.enabledStageCount != settings.enabledStageCount {
+            guard let count = proposed.enabledStageCount, (1...settings.stages.count).contains(count),
+                  (0..<count).contains(proposed.activeStage), proposed.stages.count == settings.stages.count else {
                 throw AiroxError.invalidSetting("Выберите одну из активных ступеней DPI.")
             }
             for (edited, current) in zip(proposed.stages, settings.stages) where edited != current {
-                guard edited.x == edited.y, AiroxSettings.dpiRange.contains(edited.x),
-                      edited.x.isMultiple(of: AiroxSettings.dpiStep) else {
+                guard [edited.x, edited.y].allSatisfy({ AiroxSettings.dpiRange.contains($0) && $0.isMultiple(of: AiroxSettings.dpiStep) }) else {
                     throw AiroxError.invalidSetting("DPI должен быть от 100 до 26 000 с шагом 50.")
                 }
             }
-            let selector = UInt8(proposed.activeStage << 4 | dpiCount)
+            let selector = UInt8(proposed.activeStage << 4 | count)
             let payload = [selector] + proposed.stages.flatMap { Self.encode($0.x) + Self.encode($0.y) }
             result.append(AiroxWrite(page: .dpi, code: 0x03, opcode: 0x25, payload: payload))
         }

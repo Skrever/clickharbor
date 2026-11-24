@@ -19,6 +19,7 @@ bool airox_hid_present(void);
 AiroxHID *airox_hid_open(int32_t *status);
 int32_t airox_hid_query(AiroxHID *hid, uint8_t code, uint8_t *response);
 int32_t airox_hid_write(AiroxHID *hid, const uint8_t *packet);
+int32_t airox_hid_write_confirmed(AiroxHID *hid, const uint8_t *packet);
 void airox_hid_close(AiroxHID *hid);
 
 #endif
